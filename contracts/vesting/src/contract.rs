@@ -1,7 +1,10 @@
-use soroban_sdk::{contract, contractimpl, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, token, Address, Env, Vec};
 use sororail_common::{auth, math, Error};
 
-use crate::{events, storage, types::Grant};
+use crate::{
+    events, storage,
+    types::{Checkpoint, Grant},
+};
 
 #[contract]
 pub struct VestingContract;
@@ -14,6 +17,14 @@ impl VestingContract {
     /// timestamps. `cliff == duration` is a single all-or-nothing unlock;
     /// `cliff == 0` is linear vesting with no cliff. A cliff after the end
     /// would make the schedule unreachable, so it is rejected.
+    ///
+    /// `start + duration` is rejected if it would overflow `u64`, rather than
+    /// letting [`Grant::end_at`](crate::types::Grant::end_at)'s
+    /// `saturating_add` silently cap it. This is what [`Grant::vested_amount`]
+    /// depends on to compute `effective - start` without underflowing: once
+    /// `create` has validated that the schedule's end is representable,
+    /// `effective` (which is always clamped into `[cliff_at, end]`) can never
+    /// fall below `start`.
     ///
     /// The full total is pulled from the grantor immediately -- a grant is
     /// never partially funded.
@@ -53,6 +64,9 @@ impl VestingContract {
         }
         if cliff > duration {
             return Err(Error::VestingCliffAfterEnd);
+        }
+        if start.checked_add(duration).is_none() {
+            return Err(Error::VestingScheduleOverflow);
         }
 
         grantor.require_auth();
@@ -156,6 +170,13 @@ impl VestingContract {
         events::Revoked {
             grantor: grant.grantor.clone(),
             returned_to_grantor: unvested,
+            // `claimed` can never exceed `vested` here: `claim` adds exactly
+            // the positive `claimable_at = vested - claimed`, so it never
+            // overshoots the vested amount, and `vested_amount` is monotonic
+            // in time, so the `vested` computed at revocation is at least the
+            // `vested` that capped every earlier claim. The subtraction is
+            // therefore total -- `Underflow` is unreachable, which
+            // `revoke_succeeds_after_claiming_every_vested_token` pins down.
             still_claimable: math::sub(vested, grant.claimed)?,
             revoked_at: now,
         }
@@ -165,23 +186,40 @@ impl VestingContract {
 
     /// Total vested as of `at`, whether claimed or not. Pure view.
     pub fn vested_amount(env: Env, at: u64) -> Result<i128, Error> {
-        storage::load(&env)?.vested_amount(at)
+        storage::load_view(&env)?.vested_amount(at)
     }
 
     /// Vested but not yet claimed, as of now.
     pub fn claimable(env: Env) -> Result<i128, Error> {
-        let grant = storage::load(&env)?;
+        let grant = storage::load_view(&env)?;
         grant.claimable_at(env.ledger().timestamp())
+    }
+
+    /// The schedule as a list of checkpoints, in ascending time order.
+    ///
+    /// Lets a client draw the schedule without recomputing it. Between two
+    /// consecutive checkpoints vesting is linear, so the list is the exact
+    /// curve. Reports the schedule as created; use `vested_amount` for the
+    /// revocation-aware figure.
+    pub fn schedule(env: Env) -> Result<Vec<Checkpoint>, Error> {
+        storage::load_view(&env)?.checkpoints(&env)
     }
 
     /// What the contract still holds for this grant.
     pub fn remaining(env: Env) -> Result<i128, Error> {
-        storage::load(&env)?.remaining()
+        storage::load_view(&env)?.remaining()
+    }
+
+    /// Extends the instance TTL for a long-lived grant without changing it.
+    pub fn bump(env: Env) -> Result<(), Error> {
+        storage::load_view(&env)?;
+        sororail_common::storage::extend_instance(&env);
+        Ok(())
     }
 
     /// The full grant record.
     pub fn get(env: Env) -> Result<Grant, Error> {
-        storage::load(&env)
+        storage::load_view(&env)
     }
 }
 
@@ -191,6 +229,7 @@ impl VestingContract {
     ///
     /// Always called after the state change has been persisted.
     fn pay(env: &Env, grant: &Grant, to: &Address, amount: i128) {
+        debug_assert!(amount > 0, "pay requires a positive amount");
         token::TokenClient::new(env, &grant.token).transfer(
             &env.current_contract_address(),
             to,

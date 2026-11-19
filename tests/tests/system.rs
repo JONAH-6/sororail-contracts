@@ -28,6 +28,7 @@ const START: u64 = 1_000_000;
 const MINT: i128 = 100_000_000;
 const YEAR: u64 = 31_536_000;
 const MONTH: u64 = 2_592_000;
+const ATOMIC_18: i128 = 1_000_000_000_000_000_000;
 
 /// One employer, one token, and every SoroRail contract deployed against it.
 struct System<'a> {
@@ -39,10 +40,15 @@ struct System<'a> {
     vesting: VestingContractClient<'a>,
     recurring: RecurringContractClient<'a>,
     batch: BatchPayoutContractClient<'a>,
+    minted: i128,
 }
 
 impl System<'_> {
     fn new() -> Self {
+        Self::with_mint(MINT)
+    }
+
+    fn with_mint(minted: i128) -> Self {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = START);
@@ -50,7 +56,7 @@ impl System<'_> {
         let employer = Address::generate(&env);
         let issuer = Address::generate(&env);
         let token_address = env.register_stellar_asset_contract_v2(issuer).address();
-        StellarAssetClient::new(&env, &token_address).mint(&employer, &MINT);
+        StellarAssetClient::new(&env, &token_address).mint(&employer, &minted);
 
         System {
             token: TokenClient::new(&env, &token_address),
@@ -60,6 +66,7 @@ impl System<'_> {
             recurring: RecurringContractClient::new(&env, &env.register(RecurringContract, ())),
             batch: BatchPayoutContractClient::new(&env, &env.register(BatchPayoutContract, ())),
             employer,
+            minted,
             env,
         }
     }
@@ -96,10 +103,99 @@ impl System<'_> {
     fn assert_nothing_lost(&self, parties: &[&Address]) {
         assert_eq!(
             self.total_held(parties),
-            MINT,
+            self.minted,
             "value leaked or was conjured somewhere in the system"
         );
     }
+}
+
+/// Every contract must preserve exact balances when a token uses 18 decimal
+/// places, as bridged assets commonly do.
+#[test]
+fn eighteen_decimal_token_lifecycles_conserve_value_across_every_contract() {
+    let s = System::with_mint(100 * ATOMIC_18);
+    let alice = Address::generate(&s.env);
+    let bob = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let beneficiary = Address::generate(&s.env);
+    let vendor = Address::generate(&s.env);
+    let parties = [&alice, &bob, &recipient, &beneficiary, &vendor];
+
+    let payroll = vec![
+        &s.env,
+        Payment {
+            to: alice.clone(),
+            amount: ATOMIC_18,
+        },
+        Payment {
+            to: bob.clone(),
+            amount: 2 * ATOMIC_18,
+        },
+    ];
+    let receipt = s.batch.execute(&s.employer, &s.token.address, &payroll);
+    assert_eq!(receipt.total, 3 * ATOMIC_18);
+    s.assert_nothing_lost(&parties);
+
+    s.escrow.init(
+        &s.employer,
+        &beneficiary,
+        &None,
+        &s.token.address,
+        &(3 * ATOMIC_18),
+        &(START + 100),
+    );
+    s.escrow.fund();
+    s.escrow.release(&s.employer);
+    assert_eq!(s.balance(&beneficiary), 3 * ATOMIC_18);
+    s.assert_nothing_lost(&parties);
+
+    let rate = ATOMIC_18 / 100;
+    s.stream.create(
+        &s.employer,
+        &recipient,
+        &s.token.address,
+        &rate,
+        &START,
+        &(START + 100),
+        &true,
+    );
+    s.at(START + 100);
+    assert_eq!(s.stream.withdraw(&None), ATOMIC_18);
+    assert_eq!(s.balance(&recipient), ATOMIC_18);
+    s.assert_nothing_lost(&parties);
+
+    let vesting_start = START + 100;
+    s.vesting.create(
+        &s.employer,
+        &beneficiary,
+        &s.token.address,
+        &(4 * ATOMIC_18),
+        &vesting_start,
+        &1,
+        &4,
+        &true,
+    );
+    s.at(vesting_start + 4);
+    assert_eq!(s.vesting.claim(), 4 * ATOMIC_18);
+    assert_eq!(s.balance(&beneficiary), 7 * ATOMIC_18);
+    s.assert_nothing_lost(&parties);
+
+    s.recurring.authorize(
+        &s.employer,
+        &vendor,
+        &s.token.address,
+        &(ATOMIC_18 / 2),
+        &1,
+        &Some(2),
+    );
+    let expiry = s.env.ledger().sequence() + 500_000;
+    s.token
+        .approve(&s.employer, &s.recurring.address, &ATOMIC_18, &expiry);
+    s.at(vesting_start + 5);
+    assert_eq!(s.recurring.charge(), ATOMIC_18 / 2);
+    s.recurring.cancel(&s.employer);
+    assert_eq!(s.balance(&vendor), ATOMIC_18 / 2);
+    s.assert_nothing_lost(&parties);
 }
 
 /// A month of operations touching all five contracts, then unwound.
@@ -189,7 +285,7 @@ fn an_operations_month_conserves_every_token() {
     s.stream.withdraw(&None);
     s.assert_nothing_lost(&parties);
     assert_eq!(s.balance(&vendor), 99_000);
-    assert_eq!(s.balance(&dave), MONTH as i128);
+    assert_eq!(s.balance(&dave), i128::from(MONTH));
 
     // The grant is still inside its cliff.
     assert_eq!(s.vesting.claimable(), 0);
@@ -206,7 +302,7 @@ fn an_operations_month_conserves_every_token() {
     s.assert_nothing_lost(&parties);
 
     // The stream paid out its full year and no more.
-    assert_eq!(s.balance(&dave), YEAR as i128);
+    assert_eq!(s.balance(&dave), i128::from(YEAR));
     assert_eq!(s.stream.remaining(), 0);
 
     // --- the employee leaves; the unvested remainder comes back ---
@@ -217,6 +313,275 @@ fn an_operations_month_conserves_every_token() {
     // --- and the subscription is cancelled ---
     s.recurring.cancel(&s.employer);
     s.assert_nothing_lost(&parties);
+}
+
+/// Init, fund, dispute, and resolve an escrow while tracking every balance.
+#[test]
+fn escrow_dispute_resolution_completes_the_lifecycle() {
+    let s = System::new();
+    let beneficiary = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    let amount = 2_000_003;
+    let parties = [&beneficiary, &arbiter];
+    let deadline = START + MONTH;
+
+    s.escrow.init(
+        &s.employer,
+        &beneficiary,
+        &Some(arbiter.clone()),
+        &s.token.address,
+        &amount,
+        &deadline,
+    );
+    assert_eq!(s.escrow.state(), sororail_escrow::State::Created);
+    assert_eq!(s.balance(&s.escrow.address), 0);
+    assert_eq!(s.balance(&s.employer), MINT);
+    s.assert_nothing_lost(&parties);
+
+    s.escrow.fund();
+    assert_eq!(s.escrow.state(), sororail_escrow::State::Funded);
+    assert_eq!(s.balance(&s.escrow.address), amount);
+    assert_eq!(s.balance(&s.employer), MINT - amount);
+    s.assert_nothing_lost(&parties);
+
+    s.escrow.dispute(&beneficiary);
+    assert_eq!(s.escrow.state(), sororail_escrow::State::Disputed);
+    assert_eq!(s.balance(&s.escrow.address), amount);
+    assert_eq!(s.balance(&beneficiary), 0);
+    s.assert_nothing_lost(&parties);
+
+    s.escrow.resolve(&2_500);
+    let beneficiary_share = 500_000;
+    let depositor_share = amount - beneficiary_share;
+    assert_eq!(s.escrow.state(), sororail_escrow::State::Resolved);
+    assert_eq!(s.balance(&s.escrow.address), 0);
+    assert_eq!(s.balance(&beneficiary), beneficiary_share);
+    assert_eq!(s.balance(&s.employer), MINT - beneficiary_share);
+    assert_eq!(s.balance(&arbiter), 0);
+    assert_eq!(beneficiary_share + depositor_share, amount);
+    s.assert_nothing_lost(&parties);
+}
+
+/// Top-up, partial withdrawal, and cancellation settle/refund the exact remainder.
+#[test]
+fn stream_top_up_withdraw_and_cancel_complete_the_lifecycle() {
+    let s = System::new();
+    let recipient = Address::generate(&s.env);
+    let parties = [&recipient];
+
+    s.stream.create(
+        &s.employer,
+        &recipient,
+        &s.token.address,
+        &10,
+        &START,
+        &(START + 100),
+        &true,
+    );
+    assert_eq!(s.balance(&s.stream.address), 1_000);
+    assert_eq!(s.balance(&s.employer), MINT - 1_000);
+    s.assert_nothing_lost(&parties);
+
+    s.stream.top_up(&500);
+    assert_eq!(s.stream.get().stop, START + 150);
+    assert_eq!(s.balance(&s.stream.address), 1_500);
+    assert_eq!(s.balance(&s.employer), MINT - 1_500);
+    s.assert_nothing_lost(&parties);
+
+    s.at(START + 50);
+    assert_eq!(s.stream.withdraw(&None), 500);
+    assert_eq!(s.balance(&recipient), 500);
+    assert_eq!(s.balance(&s.stream.address), 1_000);
+    s.assert_nothing_lost(&parties);
+
+    s.at(START + 100);
+    s.stream.cancel();
+    assert_eq!(s.balance(&recipient), 1_000);
+    assert_eq!(s.balance(&s.stream.address), 0);
+    assert_eq!(s.balance(&s.employer), MINT - 1_000);
+    assert_eq!(s.stream.remaining(), 0);
+    s.assert_nothing_lost(&parties);
+}
+
+/// Claims are blocked before the cliff, then accrue at and after the cliff.
+#[test]
+fn vesting_claims_track_amounts_across_the_cliff() {
+    let s = System::new();
+    let beneficiary = Address::generate(&s.env);
+    let parties = [&beneficiary];
+    let total = 1_000_000;
+    let cliff = 250;
+    let duration = 1_000;
+
+    s.vesting.create(
+        &s.employer,
+        &beneficiary,
+        &s.token.address,
+        &total,
+        &START,
+        &cliff,
+        &duration,
+        &true,
+    );
+    assert_eq!(s.balance(&s.vesting.address), total);
+    s.assert_nothing_lost(&parties);
+
+    s.at(START + cliff - 1);
+    assert_eq!(s.vesting.claimable(), 0);
+    assert_eq!(
+        s.vesting.try_claim(),
+        Err(Ok(sororail_common::Error::VestingCliffNotReached))
+    );
+    assert_eq!(s.balance(&beneficiary), 0);
+    assert_eq!(s.balance(&s.vesting.address), total);
+    s.assert_nothing_lost(&parties);
+
+    s.at(START + cliff);
+    assert_eq!(s.vesting.claimable(), 250_000);
+    assert_eq!(s.vesting.claim(), 250_000);
+    assert_eq!(s.balance(&beneficiary), 250_000);
+    assert_eq!(s.balance(&s.vesting.address), 750_000);
+    s.assert_nothing_lost(&parties);
+
+    s.at(START + cliff + 250);
+    assert_eq!(s.vesting.claimable(), 250_000);
+    assert_eq!(s.vesting.claim(), 250_000);
+    assert_eq!(s.balance(&beneficiary), 500_000);
+    assert_eq!(s.balance(&s.vesting.address), 500_000);
+    s.assert_nothing_lost(&parties);
+}
+
+/// Right after `create`, the stream contract holds exactly what was
+/// deposited for it -- no more (over-funded from elsewhere) and no less
+/// (a partial transfer that still reported success).
+#[test]
+fn stream_holds_exactly_the_deposit_after_create() {
+    let s = System::new();
+    let dave = Address::generate(&s.env);
+
+    let rate = 2;
+    let start = START;
+    let stop = START + YEAR;
+    s.stream.create(
+        &s.employer,
+        &dave,
+        &s.token.address,
+        &rate,
+        &start,
+        &stop,
+        &true,
+    );
+
+    let deposit = rate * i128::from(stop - start);
+    assert_eq!(s.stream.get().deposited, deposit);
+    assert_eq!(s.balance(&s.stream.address), deposit);
+}
+
+/// Right after `create`, the vesting contract holds exactly the granted
+/// total -- the balance the beneficiary's whole schedule is a claim
+/// against.
+#[test]
+fn vesting_holds_exactly_the_granted_total_after_create() {
+    let s = System::new();
+    let carol = Address::generate(&s.env);
+
+    let total = 12_000_000;
+    s.vesting.create(
+        &s.employer,
+        &carol,
+        &s.token.address,
+        &total,
+        &START,
+        &YEAR,
+        &(YEAR * 4),
+        &true,
+    );
+
+    assert_eq!(s.vesting.get().total, total);
+    assert_eq!(s.balance(&s.vesting.address), total);
+}
+
+/// Every stateful contract's instance (its config: sender/recipient,
+/// token, schedule) must keep responding after a ledger-sequence jump far
+/// past the 30-day TTL bump every entry point extends it to
+/// (`sororail_common::storage::INSTANCE_BUMP`). `soroban-sdk`'s test
+/// harness emulates the network's automatic restoration of an archived
+/// entry, so this mainly guards against a regression that bypasses
+/// `extend_instance` entirely (e.g. a new entry point, or a storage key
+/// change) and would otherwise go unnoticed until a real contract on
+/// mainnet is archived and un-restorable without an explicit restore
+/// transaction.
+#[test]
+fn each_contracts_instance_ttl_survives_a_long_ledger_advance() {
+    let s = System::new();
+
+    let carol = Address::generate(&s.env);
+    let dave = Address::generate(&s.env);
+    let supplier = Address::generate(&s.env);
+    let vendor = Address::generate(&s.env);
+
+    s.vesting.create(
+        &s.employer,
+        &carol,
+        &s.token.address,
+        &12_000_000,
+        &START,
+        &YEAR,
+        &(YEAR * 4),
+        &true,
+    );
+    s.stream.create(
+        &s.employer,
+        &dave,
+        &s.token.address,
+        &1,
+        &START,
+        &(START + YEAR),
+        &true,
+    );
+    s.escrow.init(
+        &s.employer,
+        &supplier,
+        &None,
+        &s.token.address,
+        &2_000_000,
+        &(START + MONTH * 2),
+    );
+    s.escrow.fund();
+    s.recurring.authorize(
+        &s.employer,
+        &vendor,
+        &s.token.address,
+        &99_000,
+        &MONTH,
+        &Some(12),
+    );
+
+    // Instance entries are bumped to 30 days (INSTANCE_BUMP) of TTL by
+    // every entry point above. Jump ten times that far in one leap, with
+    // no intervening call to re-extend it.
+    let instance_bump_ledgers = 30 * 17_280;
+    let current = s.env.ledger().sequence();
+    s.env
+        .ledger()
+        .set_sequence_number(current + 10 * instance_bump_ledgers);
+
+    assert!(
+        s.vesting.try_get().is_ok(),
+        "vesting instance unreachable after TTL advance"
+    );
+    assert!(
+        s.stream.try_get().is_ok(),
+        "stream instance unreachable after TTL advance"
+    );
+    assert!(
+        s.escrow.try_get().is_ok(),
+        "escrow instance unreachable after TTL advance"
+    );
+    assert!(
+        s.recurring.try_get().is_ok(),
+        "recurring instance unreachable after TTL advance"
+    );
 }
 
 /// Two contracts holding the same token must not see each other's funds.
@@ -287,10 +652,12 @@ fn cannot_cancel_non_cancellable_stream() {
 
     // Attempt to cancel the stream and assert the error
     let result = s.stream.try_cancel();
-    assert_eq!(result, Err(Ok(sororail_common::Error::StreamNotCancellable)));
+    assert_eq!(
+        result,
+        Err(Ok(sororail_common::Error::StreamNotCancellable))
+    );
     s.assert_nothing_lost(&parties);
 }
-
 
 /// Cancelling and revoking in the same window returns exactly the unearned
 /// portion of each, and nothing more.
@@ -409,7 +776,7 @@ fn a_full_size_batch_runs_within_a_populated_system() {
         assert_eq!(s.balance(&r), 100);
     }
 
-    let paid_out: i128 = 100 * sororail_batch_payout::MAX_RECIPIENTS as i128;
+    let paid_out: i128 = 100 * i128::from(sororail_batch_payout::MAX_RECIPIENTS);
     assert_eq!(s.balance(&s.employer), MINT - paid_out - 1_000);
 }
 
@@ -476,7 +843,8 @@ fn batch_and_recurring_payroll_workflow() {
             amount: 200_000,
         },
     ];
-    s.batch.execute(&s.employer, &s.token.address, &bonus_payroll);
+    s.batch
+        .execute(&s.employer, &s.token.address, &bonus_payroll);
     s.recurring.charge();
     assert_eq!(s.balance(&vendor), 200_000);
     s.assert_nothing_lost(&parties);
@@ -491,4 +859,145 @@ fn batch_and_recurring_payroll_workflow() {
             + s.balance(&s.recurring.address),
         MINT
     );
+}
+
+/// A batch can pay a first-time recipient, someone with an existing balance,
+/// and the same recipient more than once without losing or merging payments.
+#[test]
+fn batch_payout_handles_new_existing_and_duplicate_recipients() {
+    let s = System::new();
+    let new_recipient = Address::generate(&s.env);
+    let existing_recipient = Address::generate(&s.env);
+    let repeated_recipient = Address::generate(&s.env);
+    let parties = [&new_recipient, &existing_recipient, &repeated_recipient];
+
+    // Give one recipient a balance before the mixed batch.
+    s.token.transfer(&s.employer, &existing_recipient, &100);
+
+    let payments = vec![
+        &s.env,
+        Payment {
+            to: new_recipient.clone(),
+            amount: 11,
+        },
+        Payment {
+            to: existing_recipient.clone(),
+            amount: 22,
+        },
+        Payment {
+            to: repeated_recipient.clone(),
+            amount: 33,
+        },
+        Payment {
+            to: repeated_recipient.clone(),
+            amount: 44,
+        },
+    ];
+
+    let receipt = s.batch.execute(&s.employer, &s.token.address, &payments);
+
+    assert_eq!(receipt.count, 4);
+    assert_eq!(receipt.total, 110);
+    assert_eq!(s.balance(&new_recipient), 11);
+    assert_eq!(s.balance(&existing_recipient), 122);
+    assert_eq!(s.balance(&repeated_recipient), 77);
+    s.assert_nothing_lost(&parties);
+}
+
+/// Recurring authorizations charge once per elapsed period and stop at their
+/// configured cap, even when another charge is attempted immediately.
+#[test]
+fn recurring_subscription_charges_once_across_several_periods() {
+    let s = System::new();
+    let vendor = Address::generate(&s.env);
+    let parties = [&vendor];
+    let amount = 125_000;
+    let periods = 3;
+
+    s.recurring.authorize(
+        &s.employer,
+        &vendor,
+        &s.token.address,
+        &amount,
+        &MONTH,
+        &Some(periods),
+    );
+    let expiry = s.env.ledger().sequence() + 500_000;
+    s.token
+        .approve(&s.employer, &s.recurring.address, &MINT, &expiry);
+
+    for period in 1..=periods {
+        let due_at = START + MONTH * u64::from(period);
+        s.at(due_at - 1);
+        assert_eq!(
+            s.recurring.try_charge(),
+            Err(Ok(sororail_common::Error::RecurringPeriodNotElapsed))
+        );
+        assert_eq!(s.balance(&vendor), amount * i128::from(period - 1));
+
+        s.at(due_at);
+        assert_eq!(s.recurring.charge(), amount);
+        assert_eq!(s.balance(&vendor), amount * i128::from(period));
+        let second_charge_error = if period == periods {
+            sororail_common::Error::RecurringExhausted
+        } else {
+            sororail_common::Error::RecurringPeriodNotElapsed
+        };
+        assert_eq!(s.recurring.try_charge(), Err(Ok(second_charge_error)));
+        s.assert_nothing_lost(&parties);
+    }
+
+    assert_eq!(s.recurring.remaining_periods(), Some(0));
+    s.at(START + MONTH * u64::from(periods + 1));
+    assert_eq!(
+        s.recurring.try_charge(),
+        Err(Ok(sororail_common::Error::RecurringExhausted))
+    );
+    assert_eq!(s.balance(&vendor), amount * i128::from(periods));
+    s.assert_nothing_lost(&parties);
+}
+
+/// Every stateful contract reports `NotInitialized` from a state-backed view
+/// before its setup entry point has run. `batch_payout` is stateless, so it has
+/// no initialization state to reject.
+#[test]
+fn stateful_contracts_reject_calls_before_initialization() {
+    let s = System::new();
+    let stateful_contracts = [
+        (
+            "escrow",
+            matches!(
+                s.escrow.try_get(),
+                Err(Ok(sororail_common::Error::NotInitialized))
+            ),
+        ),
+        (
+            "stream",
+            matches!(
+                s.stream.try_get(),
+                Err(Ok(sororail_common::Error::NotInitialized))
+            ),
+        ),
+        (
+            "vesting",
+            matches!(
+                s.vesting.try_get(),
+                Err(Ok(sororail_common::Error::NotInitialized))
+            ),
+        ),
+        (
+            "recurring",
+            matches!(
+                s.recurring.try_get(),
+                Err(Ok(sororail_common::Error::NotInitialized))
+            ),
+        ),
+    ];
+
+    for (name, rejects_uninitialized_call) in stateful_contracts {
+        assert!(
+            rejects_uninitialized_call,
+            "{name} did not return NotInitialized"
+        );
+    }
 }

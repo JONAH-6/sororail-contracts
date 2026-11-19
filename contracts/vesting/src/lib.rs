@@ -17,10 +17,26 @@ claimed + returned + remaining == total
 ```
 
 exactly, at every point in the lifecycle, with no rounding leakage.
+
+## Entry points
+
+| Entry point | Caller | Effect |
+|---|---|---|
+| `create` | grantor | Records the schedule and pulls the full `total` amount in. |
+| `claim` | beneficiary | Pays out what has vested and not yet been claimed. |
+| `revoke` | grantor | On a revocable grant, returns the unvested remainder to the grantor. |
+| `vested_amount` | anyone | Vested amount at a given ledger timestamp. |
+| `claimable`, `remaining`, `schedule` | anyone | Current claimable amount, unclaimed balance, and checkpoints. |
+| `bump`, `get` | anyone | Extends TTL; reads the full grant record. |
+
+See [`Error`] for the typed failures each entry point can return.
 "#]
 
 #[cfg(test)]
 extern crate std;
+
+soroban_sdk::contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+soroban_sdk::contractmeta!(key = "git_commit", val = env!("SORORAIL_GIT_COMMIT"));
 
 pub mod contract;
 pub mod errors;

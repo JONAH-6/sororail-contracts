@@ -3,16 +3,31 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    token::{StellarAssetClient, TokenClient},
+    testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
+    token::TokenClient,
     Address, Env, Event,
 };
-use sororail_common::Error;
+use sororail_common::{storage::INSTANCE_BUMP, testutils::TestEnv, Error};
 
 use crate::{
     contract::{RecurringContract, RecurringContractClient},
     events::{Authorized, Cancelled, Charged},
 };
+
+#[test]
+fn bump_restores_the_instance_ttl_after_ledger_advance() {
+    let f = Fixture::new(None);
+    f.env
+        .ledger()
+        .set_sequence_number(f.env.ledger().sequence() + INSTANCE_BUMP - 1);
+    f.env.as_contract(&f.client.address, || {
+        assert!(f.env.storage().instance().get_ttl() < INSTANCE_BUMP);
+    });
+    f.client.bump();
+    f.env.as_contract(&f.client.address, || {
+        assert_eq!(f.env.storage().instance().get_ttl(), INSTANCE_BUMP);
+    });
+}
 
 const AMOUNT: i128 = 10_000;
 const PERIOD: u64 = 2_592_000; // 30 days
@@ -30,16 +45,13 @@ struct Fixture<'a> {
 
 impl Fixture<'_> {
     fn new(max_periods: Option<u32>) -> Self {
-        let env = Env::default();
-        env.mock_all_auths();
-        env.ledger().with_mut(|l| l.timestamp = START);
-
-        let payer = Address::generate(&env);
-        let payee = Address::generate(&env);
-        let outsider = Address::generate(&env);
-        let issuer = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract_v2(issuer).address();
-        StellarAssetClient::new(&env, &token_address).mint(&payer, &MINT);
+        let te = TestEnv::at(START);
+        let payer = te.make_address();
+        let payee = te.make_address();
+        let outsider = te.make_address();
+        let token_address = te.register_token();
+        te.mint(&token_address, &payer, MINT);
+        let env = te.env().clone();
 
         let client = RecurringContractClient::new(&env, &env.register(RecurringContract, ()));
         client.authorize(
@@ -136,6 +148,20 @@ fn authorize_rejects_a_zero_cap() {
 }
 
 #[test]
+fn authorize_rejects_identical_payer_and_payee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let c = RecurringContractClient::new(&env, &env.register(RecurringContract, ()));
+    let party = Address::generate(&env);
+    let token = Address::generate(&env);
+    assert_eq!(
+        c.try_authorize(&party, &party, &token, &AMOUNT, &PERIOD, &None),
+        Err(Ok(Error::IdenticalParties))
+    );
+    assert_eq!(c.try_get(), Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
 fn authorize_rejects_a_second_call() {
     let f = Fixture::new(None);
     assert_eq!(
@@ -161,6 +187,43 @@ fn entry_points_error_before_authorize() {
     assert_eq!(c.try_cancel(&who), Err(Ok(Error::NotInitialized)));
     assert_eq!(c.try_next_chargeable_at(), Err(Ok(Error::NotInitialized)));
     assert_eq!(c.try_is_chargeable(), Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn authorize_rejects_multiple_invalid_args_in_order() {
+    let f = Fixture::new(None);
+
+    // InvalidAmount comes before InvalidDuration
+    let env = f.env.clone();
+    let contract_id = env.register(RecurringContract, ());
+    let client = RecurringContractClient::new(&env, &contract_id);
+    assert_eq!(
+        client.try_authorize(&f.payer, &f.payee, &f.token.address, &0, &0, &None),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // InvalidDuration comes before InvalidBasisPoints
+    let contract_id2 = env.register(RecurringContract, ());
+    let client2 = RecurringContractClient::new(&env, &contract_id2);
+    assert_eq!(
+        client2.try_authorize(
+            &f.payer,
+            &f.payee,
+            &f.token.address,
+            &AMOUNT,
+            &0,
+            &Some(20_000)
+        ),
+        Err(Ok(Error::InvalidDuration))
+    );
+
+    // The fixture is already initialized. AlreadyInitialized comes before
+    // amount validation on a second call.
+    assert_eq!(
+        f.client
+            .try_authorize(&f.payer, &f.payee, &f.token.address, &0, &PERIOD, &None),
+        Err(Ok(Error::AlreadyInitialized))
+    );
 }
 
 #[test]
@@ -271,6 +334,69 @@ fn charge_cannot_be_taken_twice_in_one_period() {
     assert_eq!(f.token.balance(&f.payee), AMOUNT);
 }
 
+/// Issue #478: double charging within one period is the highest-impact
+/// failure for a subscription contract. The second `charge` in the same
+/// period must fail with `RecurringPeriodNotElapsed` and leave every balance,
+/// the allowance and the schedule exactly as the first charge left them --
+/// including at the exact boundary second of both the first and next period.
+#[test]
+fn charge_twice_in_the_same_period_fails_and_leaves_balances_unchanged() {
+    let f = Fixture::new(None);
+    let snapshot = |f: &Fixture| {
+        (
+            f.token.balance(&f.payer),
+            f.token.balance(&f.payee),
+            f.token.balance(&f.client.address),
+            f.token.allowance(&f.payer, &f.client.address),
+            f.client.get(),
+        )
+    };
+
+    // One second before the first boundary: not yet chargeable.
+    f.at(START + PERIOD - 1);
+    assert_eq!(
+        f.client.try_charge(),
+        Err(Ok(Error::RecurringPeriodNotElapsed))
+    );
+
+    // Exactly at the boundary second the first charge goes through.
+    f.at(START + PERIOD);
+    assert_eq!(f.client.charge(), AMOUNT);
+    let after_first = snapshot(&f);
+    assert_eq!(after_first.0, MINT - AMOUNT);
+    assert_eq!(after_first.1, AMOUNT);
+    assert_eq!(after_first.4.periods_charged, 1);
+    assert_eq!(after_first.4.next_chargeable_at, START + PERIOD * 2);
+
+    // A second charge in that same boundary second is refused...
+    assert_eq!(
+        f.client.try_charge(),
+        Err(Ok(Error::RecurringPeriodNotElapsed))
+    );
+    assert_eq!(snapshot(&f), after_first);
+
+    // ...and so is one at the last second of the period.
+    f.at(START + PERIOD * 2 - 1);
+    assert_eq!(
+        f.client.try_charge(),
+        Err(Ok(Error::RecurringPeriodNotElapsed))
+    );
+    assert_eq!(snapshot(&f), after_first);
+
+    // At the next boundary second exactly one more charge is allowed.
+    f.at(START + PERIOD * 2);
+    assert_eq!(f.client.charge(), AMOUNT);
+    let after_second = snapshot(&f);
+    assert_eq!(after_second.0, MINT - AMOUNT * 2);
+    assert_eq!(after_second.1, AMOUNT * 2);
+    assert_eq!(after_second.4.periods_charged, 2);
+    assert_eq!(
+        f.client.try_charge(),
+        Err(Ok(Error::RecurringPeriodNotElapsed))
+    );
+    assert_eq!(snapshot(&f), after_second);
+}
+
 #[test]
 fn skipped_periods_are_forfeited_not_banked() {
     // The consumer-protection property. A payee who forgets for three periods
@@ -298,6 +424,26 @@ fn charging_on_schedule_bills_once_per_period() {
     }
     assert_eq!(f.token.balance(&f.payee), AMOUNT * 6);
     assert_eq!(f.client.get().periods_charged, 6);
+}
+
+/// After a charge, `next_chargeable_at` advances by exactly one period from
+/// the charge instant (`now + period_seconds`), not from the old due date --
+/// the rule documented on `Authorization` (#249).
+#[test]
+fn next_chargeable_at_advances_by_exactly_one_period_after_a_charge() {
+    let f = Fixture::new(None);
+    assert_eq!(f.client.next_chargeable_at(), START + PERIOD);
+
+    // Charge 500s late: the next due date is still one full period from the
+    // charge instant, not one period from the missed boundary.
+    let charged_at = START + PERIOD + 500;
+    f.at(charged_at);
+    f.client.charge();
+    assert_eq!(f.client.next_chargeable_at(), charged_at + PERIOD);
+    assert_eq!(
+        f.client.get().next_chargeable_at,
+        f.client.next_chargeable_at()
+    );
 }
 
 #[test]
@@ -376,7 +522,6 @@ fn charge_fails_when_allowance_covers_fewer_periods_than_remain() {
     assert_eq!(f.client.get().periods_charged, 2);
 }
 
-
 /// `charge` bumps `periods_charged` before `transfer_from`. A failed token
 /// call must roll that write back — `get()` still shows the pre-charge count.
 #[test]
@@ -399,6 +544,47 @@ fn charge_requires_the_payees_authorization() {
     f.at(START + PERIOD);
     f.env.set_auths(&[]);
     f.client.charge();
+}
+
+/// When the payer's token allowance to this contract is insufficient,
+/// `charge` must fail cleanly — reverting the `periods_charged` /
+/// `next_chargeable_at` state that was persisted just before the
+/// `transfer_from` call (#100).
+#[test]
+fn charge_reverts_schedule_state_when_allowance_is_insufficient() {
+    let f = Fixture::new(None);
+    let expiry = f.env.ledger().sequence() + 100_000;
+    // Set allowance to less than one period's worth.
+    f.token
+        .approve(&f.payer, &f.client.address, &(AMOUNT - 1), &expiry);
+
+    f.at(START + PERIOD);
+    assert!(f.client.try_charge().is_err());
+    // Schedule state must be unchanged — the failed transfer_from rolled
+    // back the optimistic write.
+    assert_eq!(f.client.get().periods_charged, 0);
+    assert_eq!(f.client.next_chargeable_at(), START + PERIOD);
+    assert_eq!(f.token.balance(&f.payee), 0);
+}
+
+/// When the payer's token allowance has expired (TTL reached 0), `charge`
+/// must fail and leave the schedule state untouched (#100).
+#[test]
+fn charge_reverts_schedule_state_when_allowance_is_expired() {
+    let f = Fixture::new(None);
+    // Grant an allowance that expires immediately.
+    let current_seq = f.env.ledger().sequence();
+    f.token
+        .approve(&f.payer, &f.client.address, &MINT, &(current_seq + 1));
+    // Advance the ledger past the allowance expiry.
+    f.env
+        .ledger()
+        .with_mut(|l| l.sequence_number = current_seq + 100_000);
+
+    f.at(START + PERIOD);
+    assert!(f.client.try_charge().is_err());
+    assert_eq!(f.client.get().periods_charged, 0);
+    assert_eq!(f.token.balance(&f.payee), 0);
 }
 
 // ------------------------------------------------------------------ cancel
@@ -477,6 +663,34 @@ fn cancelling_mid_subscription_keeps_what_was_already_charged() {
     assert_eq!(f.token.balance(&f.payee), AMOUNT);
 }
 
+/// Cancellation changes nothing about the period bookkeeping: the count
+/// reported after `cancel` still matches the stored record --
+/// `max_periods - periods_charged` when capped, `None` when uncapped (#251).
+#[test]
+fn remaining_periods_after_cancellation_matches_the_stored_state() {
+    let f = Fixture::new(Some(3));
+    f.at(START + PERIOD);
+    f.client.charge();
+    f.client.cancel(&f.payer);
+
+    let stored = f.client.get();
+    assert_eq!(f.client.remaining_periods(), Some(2));
+    assert_eq!(
+        f.client.remaining_periods(),
+        stored.remaining_periods(),
+        "reported count diverged from the stored authorization"
+    );
+    assert_eq!(
+        f.client.remaining_periods(),
+        Some(stored.max_periods.unwrap() - stored.periods_charged)
+    );
+
+    // An uncapped authorization still reports no count after cancellation.
+    let uncapped = Fixture::new(None);
+    uncapped.client.cancel(&uncapped.payer);
+    assert_eq!(uncapped.client.remaining_periods(), None);
+}
+
 #[test]
 fn is_chargeable_tracks_the_schedule_and_the_cancellation() {
     let f = Fixture::new(None);
@@ -485,4 +699,19 @@ fn is_chargeable_tracks_the_schedule_and_the_cancellation() {
     assert!(f.client.is_chargeable());
     f.client.cancel(&f.payer);
     assert!(!f.client.is_chargeable());
+}
+
+/// The period rule in `types.rs` is `at >= next_chargeable_at`: one second
+/// before the boundary a charge is refused, and it becomes chargeable exactly
+/// on the boundary, not a second later (#250).
+#[test]
+fn is_chargeable_is_true_exactly_at_the_period_boundary() {
+    let f = Fixture::new(None);
+    f.at(START + PERIOD - 1);
+    assert!(!f.client.is_chargeable());
+    f.at(START + PERIOD);
+    assert!(f.client.is_chargeable());
+    // Still chargeable past the boundary until the charge is actually taken.
+    f.at(START + PERIOD + 1);
+    assert!(f.client.is_chargeable());
 }

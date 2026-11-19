@@ -4,7 +4,7 @@
 
 > **This document is a build specification.** It describes a GitHub organization across two repositories. Build one repository at a time and finish it before starting the next.
 
-> **Revision note (2026-09-07).** This spec originally described *five* repositories — `contracts`, `sdk`, `app`, `docs` and `.github`. It has been consolidated to **two** at the maintainer's direction: `sdk`, `app` and `docs` are now one `frontend` repo, and `.github`'s templates are copied into each repo instead of inherited. Two contradictions in the original were also fixed: it named a `token_utils` crate that appeared nowhere else (the shared crate is `common`), and it gave two different build orders. Sections describing already-built code have been updated to describe what was actually built.
+> **Revision note (2026-09-07).** This spec originally described _five_ repositories — `contracts`, `sdk`, `app`, `docs` and `.github`. It has been consolidated to **two** at the maintainer's direction: `sdk`, `app` and `docs` are now one `frontend` repo, and `.github`'s templates are copied into each repo instead of inherited. Two contradictions in the original were also fixed: it named a `token_utils` crate that appeared nowhere else (the shared crate is `common`), and it gave two different build orders. Sections describing already-built code have been updated to describe what was actually built.
 
 ---
 
@@ -40,10 +40,10 @@ The design target is `openzeppelin-contracts` for Stellar payments — boring, c
 
 GitHub organization: **`sororail`**
 
-| Repo | Language | Purpose | Depends on |
-|---|---|---|---|
-| `contracts` | Rust / Soroban | The payment contracts. The core deliverable. | — |
-| `frontend` | TypeScript | The SDK, the reference application, and the docs site. | `contracts` |
+| Repo        | Language       | Purpose                                                | Depends on  |
+| ----------- | -------------- | ------------------------------------------------------ | ----------- |
+| `contracts` | Rust / Soroban | The payment contracts. The core deliverable.           | —           |
+| `frontend`  | TypeScript     | The SDK, the reference application, and the docs site. | `contracts` |
 
 ```
       contracts  (Rust, Soroban)
@@ -85,12 +85,12 @@ Within `frontend`, build the SDK first, then the app, then the docs — the docs
 
 > Composable Soroban payment contracts. Rust, `no_std`, audited-in-intent.
 >
-> **Status: built.** 156 tests passing; fmt, clippy `-D warnings` and the wasm build green. Not yet deployed, not yet audited. See the repo's own README for the current gap list.
+> **Status: built and deployed to testnet.** 161 tests passing; fmt, clippy `-D warnings` and the wasm build green. Testnet addresses recorded in `DEPLOYMENTS.md`. Not yet audited. See the repo's own README for the current gap list.
 
 ### Stack
 
 - Rust, edition 2021, toolchain pinned in `rust-toolchain.toml`
-- `soroban-sdk` **27.0.6** — the latest *stable*. Note 28.0.0-rc.1 is published to crates.io; it is a prerelease and must not be pinned.
+- `soroban-sdk` **27.0.6** — the latest _stable_. Note 28.0.0-rc.1 is published to crates.io; it is a prerelease and must not be pinned.
 - `stellar` CLI 27.1.0 for build, deploy and invoke
 - Target **`wasm32v1-none`**, not `wasm32-unknown-unknown` — soroban-sdk ≥22 no longer targets the latter
 - `cargo-nextest` as the CI test runner
@@ -127,7 +127,9 @@ Each is independently deployable; composition happens at the call site, not thro
 Not a contract — a shared library crate.
 
 - `Error` enum with a stable, documented numeric mapping, one shared enum across the org with a reserved range per contract. **Never renumber or remove a released variant**; clients decode failures by integer.
-- Storage key enums and TTL/bump helpers. Soroban state expires; every contract must extend TTL on access, and this logic lives here so it is written once.
+- Storage key enums and TTL/bump helpers. Soroban state expires; mutating
+  operations extend TTL, while views remain read-only. Long-lived positions
+  expose `bump()` so an integrator can keep them alive.
 - `require_auth` guard helpers. These check **membership before calling `require_auth`** — the reverse order would prompt an address that was never permitted to act.
 - Basis-point math with explicit overflow handling. No silent saturation. `split_bps` derives the remainder by subtraction so splits conserve the total exactly.
 
@@ -140,9 +142,13 @@ Funds held by the contract, released on a condition.
 - `init(depositor, beneficiary, arbiter: Option<Address>, token, amount, deadline)`
 - `fund()` — pulls tokens from depositor
 - `release(caller)` — beneficiary receives; callable by depositor or arbiter
-- `refund(caller)` — callable by depositor after deadline, or by arbiter at any time
+- `refund(caller)` — callable by depositor after deadline, or by arbiter at any time. If in `Disputed` state, callable by anyone after 7 days past the original deadline to recover from an unresponsive arbiter.
 - `dispute(caller)` / `resolve(split_bps)` — arbiter splits between parties; `split_bps` is the beneficiary's share
+- `dispute` requires a configured arbiter; calling it without one returns `EscrowNoArbiter`, so `Disputed` is never reachable without an arbiter. `resolve` re-checks independently as defense-in-depth.
+- Calling `dispute` on an escrow that is already in `Disputed` state returns `EscrowAlreadyDisputed`. Once disputed, a second `dispute` call is rejected so the arbiter cannot be overridden mid-resolution.
+- `fund` requires `deadline` not to have passed (inclusive); past it, it errors with a dedicated `DeadlinePassed` rather than the generic `EscrowClosed`, since the escrow is still `Created`, not terminal.
 - States: `Created → Funded → (Released | Refunded | Disputed → Resolved)`. Illegal transitions must error, not panic.
+- **Dispute timeout:** Once the deadline passes, an unresolved dispute has a 7-day grace period. After this period, either party (or anyone) may refund to recover funds from an unresponsive arbiter. This is a safety mechanism, not a normal flow.
 
 #### `stream`
 
@@ -156,6 +162,7 @@ Continuous per-second transfer from sender to recipient.
 - Accrual is computed from ledger timestamp at read time. Never write per-second state.
 - The critical correctness property: withdrawn + refunded + remaining always equals deposited, exactly, with no rounding leakage. Test this as an invariant.
 - The stream is fully funded for its whole declared span, so `deposited == rate * (stop - start)` always holds. `top_up` therefore rejects an amount that is not a whole number of seconds rather than stranding the remainder.
+- Unlike `vesting`'s proportional math, this contract's math never divides at all — accrual is pure multiplication (`rate * elapsed`) — so "no rounding leakage" holds by construction, not by a rounding-direction rule. There is no rounding direction to pick here.
 
 #### `vesting`
 
@@ -165,6 +172,8 @@ Scheduled release against a schedule, with a cliff.
 - `claim()` — beneficiary withdraws vested-but-unclaimed
 - `revoke()` — grantor reclaims unvested; vested portion stays claimable
 - `vested_amount(at: u64)` — pure view, testable in isolation
+- `schedule()` — the schedule as a list of `Checkpoint { at, vested }` corners: start, cliff, and end (cliff and end collapse when they coincide). Linear between consecutive checkpoints. Reports the schedule as created, so it is unaffected by revocation.
+- `create` rejects `grantor == beneficiary` with `IdenticalParties` before any funds move.
 - Linear vesting after cliff. Nothing claimable before cliff. Fully vested at `start + duration`.
 - `cliff` and `duration` are spans in seconds from `start`, not absolute timestamps. `cliff == duration` is a legal all-or-nothing unlock.
 - Grants are immutable once created — no `top_up` or `extend` like `stream` provides. Issue a new grant for additional allocations.
@@ -173,11 +182,12 @@ Scheduled release against a schedule, with a cliff.
 
 Pull-based authorization for subscriptions. The payer authorizes a cap and cadence; the payee pulls within it.
 
-- `authorize(payer, payee, token, amount_per_period, period_seconds, max_periods: Option<u32>)`
+- `authorize(payer, payee, token, amount_per_period, period_seconds, max_periods: Option<u32>)` — rejects `payer == payee` with `IdenticalParties`
 - `charge()` — callable by payee, at most once per elapsed period
 - `cancel(caller)` — callable by either party, effective immediately
 - `next_chargeable_at()` — view
 - Must not accrue chargeable periods retroactively when a payee skips one. A payee who forgets to charge for three months cannot then charge three times. This is a deliberate consumer-protection choice; document it prominently.
+- Consequence for automated payees: whoever drives `charge` on a schedule (for example the scheduled recurring runs in [`apps/web`'s Payroll feature](#appsweb)) gets no catch-up after downtime, a failed cron, or a skipped job. The next successful `charge` collects exactly one period however many have elapsed, and every other elapsed period is forfeited. A late charge also restarts the cadence from the moment it lands (`next_chargeable_at = now + period_seconds`), so repeated lateness drifts the schedule. The rationale is documented on `recurring::Authorization`.
 - The pull works through the token's allowance: the payer `approve`s this contract as spender and `charge` uses `transfer_from`. The contract holds no funds, and revoking the allowance stops charges without touching the contract.
 
 #### `batch_payout`
@@ -201,7 +211,85 @@ Non-negotiable, and the main thing that makes this credible as a dependency:
 - Arithmetic edge cases: zero amounts, `i128::MAX`, one-second durations, cliff equal to duration, stop before start.
 - Conservation invariants for `stream` and `vesting`, as described above.
 - Integration tests in `/tests` that deploy real token contracts and exercise full lifecycles.
-- Target ≥90% line coverage, enforced in CI.
+- Target ≥90% line coverage, enforced in CI, with additional region (≥75%) and
+  function (≥80%) floors so error-path branches cannot hide behind high line
+  counts. CI also audits that every `Error::*` variant is named in the test corpus.
+
+### Cross-contract design conventions
+
+Each contract is internally consistent, but a few idioms differ between contracts on purpose. They are recorded here so a contributor moving between crates does not read a deliberate difference as drift.
+
+#### Authorization: `caller` argument vs. `require_auth` on a fixed party
+
+The rule is set by how many parties may call an entry point:
+
+| Permitted callers       | Signature            | Check                                                             | Wrong caller gets                      |
+| ----------------------- | -------------------- | ----------------------------------------------------------------- | -------------------------------------- |
+| Exactly one fixed party | no `caller` argument | `stored_party.require_auth()`                                     | an authorization failure from the host |
+| Two or more parties     | `caller: Address`    | an `auth::require_auth_*` guard — membership, then `require_auth` | `Error::Unauthorized`                  |
+
+| Contract       | Single fixed party                                            | Several permitted parties (`caller`)                                             |
+| -------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `escrow`       | `init`, `fund`, `cancel` (depositor); `resolve` (arbiter)     | `release`, `refund` (depositor or arbiter); `dispute` (depositor or beneficiary) |
+| `stream`       | `withdraw` (recipient); `cancel`, `top_up`, `extend` (sender) | —                                                                                |
+| `vesting`      | `claim` (beneficiary); `revoke` (grantor)                     | —                                                                                |
+| `recurring`    | `authorize` (payer); `charge` (payee)                         | `cancel` (payer or payee)                                                        |
+| `batch_payout` | `execute`, `execute_equal` (funder)                           | —                                                                                |
+
+A `caller` argument exists only when the contract cannot otherwise know who is acting. It also records who acted in the emitted event (`released_by`, `refunded_by`, `raised_by`, `cancelled_by`). This is why `Unauthorized` appears only in the `escrow` and `recurring` error tables. Each contract's `errors.rs` explains why the variants it never returns are absent. The contributor-facing rules for picking a pattern are in [CONTRIBUTING.md](CONTRIBUTING.md#choosing-an-authorization-pattern).
+
+#### Authorization model, by entry point
+
+Every public function, and which address(es) may call it. "—" means the function is a read-only view with no authorization check at all.
+
+| Contract       | Function               | May call it                                                    |
+| -------------- | ----------------------- | --------------------------------------------------------------- |
+| `escrow`       | `init`                  | depositor                                                       |
+| `escrow`       | `cancel`                | depositor                                                       |
+| `escrow`       | `fund`                  | depositor                                                       |
+| `escrow`       | `release`               | depositor or arbiter                                            |
+| `escrow`       | `refund`                | depositor or arbiter (anyone, after the dispute grace period)   |
+| `escrow`       | `dispute`               | depositor or beneficiary                                        |
+| `escrow`       | `resolve`               | arbiter                                                         |
+| `escrow`       | `state`, `bump`, `get`  | —                                                                |
+| `stream`       | `create`                | sender                                                          |
+| `stream`       | `withdraw`              | recipient                                                       |
+| `stream`       | `cancel`                | sender                                                          |
+| `stream`       | `top_up`                | sender                                                          |
+| `stream`       | `extend`                | sender                                                          |
+| `stream`       | `balance_of`, `remaining`, `bump`, `get` | —                                               |
+| `vesting`      | `create`                | grantor                                                         |
+| `vesting`      | `claim`                 | beneficiary                                                     |
+| `vesting`      | `revoke`                | grantor                                                         |
+| `vesting`      | `vested_amount`, `claimable`, `schedule`, `remaining`, `bump`, `get` | —                      |
+| `recurring`    | `authorize`             | payer                                                           |
+| `recurring`    | `charge`                | payee                                                            |
+| `recurring`    | `cancel`                | payer or payee                                                  |
+| `recurring`    | `next_chargeable_at`, `is_chargeable`, `remaining_periods`, `bump`, `get` | —            |
+| `batch_payout` | `execute`               | funder                                                          |
+| `batch_payout` | `execute_equal`         | funder                                                          |
+| `batch_payout` | `max_recipients`, `preview` | —                                                           |
+
+A wrong caller on a privileged function above gets either an authorization failure from the host (single fixed party) or `Error::Unauthorized` (several permitted parties) — see the caller-vs-`require_auth` rule just above.
+
+#### Lifecycle modeling: explicit `State` enum vs. optional timestamps
+
+| Contract    | Lifecycle                                         | Representation                                                                     | "Still active?" helper                                |
+| ----------- | ------------------------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `escrow`    | six states, several branches                      | `State` enum (`Created`, `Funded`, `Released`, `Refunded`, `Disputed`, `Resolved`) | `State::is_terminal()`                                |
+| `stream`    | active → cancelled                                | `cancelled_at: Option<u64>`                                                        | `Stream::is_cancelled()`                              |
+| `vesting`   | active → revoked                                  | `revoked_at: Option<u64>`                                                          | `Grant::is_revoked()`                                 |
+| `recurring` | active → cancelled, or exhausted by `max_periods` | `cancelled: bool` plus `periods_charged` against the cap                           | `Authorization::is_exhausted()`, `is_chargeable_at()` |
+
+The rule: **use an explicit `#[contracttype]` state enum once the lifecycle has more than one non-terminal state or more than one way out of a state.** Escrow has both. `Funded` can go to three different places, and `Disputed` is a non-terminal state of its own. Encoding that as a set of flags would allow impossible combinations such as "released and disputed". An enum makes illegal transitions unrepresentable and gives each one a named error.
+
+A binary, one-way lifecycle (active, then permanently stopped) stays as an `Option<u64>` timestamp. The timestamp is data the contract needs anyway: `stream` stops accrual at `cancelled_at`, and `vesting` freezes the vested amount at `revoked_at`. An enum would therefore duplicate that field rather than replace it. `recurring` uses a plain `bool` because nothing is computed from the cancellation time. That time is emitted in the `Cancelled` event but not stored.
+
+Conventions that hold regardless of representation:
+
+- The "is this position still usable?" question is always answered by a named helper on the type in `types.rs` (`is_terminal`, `is_cancelled`, `is_revoked`, `is_exhausted`), never by inspecting fields inline in `contract.rs`.
+- Every illegal transition returns a contract-specific typed error (`EscrowClosed`, `StreamCancelled`, `VestingRevoked`, `RecurringCancelled`), never the generic `InvalidState` and never a panic.
+- If a binary lifecycle later gains a second non-terminal state (for example, a pausable stream), migrate it to a state enum rather than adding a second `Option` field. Changing a stored `#[contracttype]` is an ABI and storage-layout break, so treat it as one.
 
 ### Open design question
 
@@ -271,12 +359,12 @@ A real application, not a demo page — but its purpose is demonstrative, so fav
 
 **Features**
 
-- *Wallet and account* — connect via Freighter, network detection with a hard warning on mismatch, testnet faucet link and a clear testnet-only banner.
-- *Payroll* (`batch_payout` + `recurring`) — recipient list with CSV import, preview of total and per-recipient amounts and estimated fees before signing, batch execution with per-recipient confirmation, scheduled recurring runs. Duplicate detection belongs here, in the CSV import — the contract deliberately allows duplicates.
-- *Streams* (`stream`) — create with a live preview of the accrual curve, dashboard of incoming and outgoing streams with balances ticking in real time, withdraw / top up / extend / cancel.
-- *Vesting* (`vesting`) — create a grant with a visual schedule showing cliff and linear ramp, beneficiary view with claimable amount and next unlock, revoke for revocable grants.
-- *Escrow* (`escrow`) — create, fund, release, refund, optional arbiter with dispute and split-resolution flow.
-- *History* — unified event feed across all contracts from the indexer, CSV export.
+- _Wallet and account_ — connect via Freighter, network detection with a hard warning on mismatch, testnet faucet link and a clear testnet-only banner.
+- _Payroll_ (`batch_payout` + `recurring`) — recipient list with CSV import, preview of total and per-recipient amounts and estimated fees before signing, batch execution with per-recipient confirmation, scheduled recurring runs. The scheduler must treat a missed run as lost, not deferred: `recurring` never accrues periods retroactively, so if downtime or a failed cron lets more than one period elapse, the next `charge` collects only one of them and the rest are permanently forfeited (see [`recurring`](#recurring)). The scheduler cannot catch up by charging repeatedly, so it should surface missed runs to the operator instead. Duplicate detection belongs here, in the CSV import — the contract deliberately allows duplicates.
+- _Streams_ (`stream`) — create with a live preview of the accrual curve, dashboard of incoming and outgoing streams with balances ticking in real time, withdraw / top up / extend / cancel.
+- _Vesting_ (`vesting`) — create a grant with a visual schedule showing cliff and linear ramp, beneficiary view with claimable amount and next unlock, revoke for revocable grants.
+- _Escrow_ (`escrow`) — create, fund, release, refund, optional arbiter with dispute and split-resolution flow.
+- _History_ — unified event feed across all contracts from the indexer, CSV export.
 
 **Backend**
 
@@ -348,7 +436,7 @@ The credibility of this project rests on not overstating its maturity. A library
 
 ## Roadmap
 
-**v0.1 — foundations.** All six contract crates with full tests. ✅ Contracts done; testnet deployment and contract-spec release outstanding.
+**v0.1 — foundations.** All six contract crates with full tests. ✅ Contracts done. ✅ Deployed to testnet (see `DEPLOYMENTS.md`). Contract-spec release still outstanding.
 
 **v0.2 — the SDK.** SDK clients for all five contracts, error decoding, Freighter and keypair signers, runnable examples. `MAX_RECIPIENTS` re-measured against testnet. The one-position-per-instance question settled.
 
@@ -368,7 +456,7 @@ This spec was written from a snapshot and the Soroban toolchain moves quickly. C
 2. ✅ **Current `stellar` CLI syntax** — 27.1.0. The CLI was renamed from `soroban` and command shapes have changed across releases; older tutorials will be wrong.
 3. **Protocol version on testnet** and which host functions are available. Not yet checked — needs network access.
 4. ✅ **Current `@stellar/stellar-sdk` major version** — 17.0.1.
-5. ⚠️ **Resource limits** — instruction count, ledger entry size, transaction size. Measured *locally* at 40 recipients for `batch_payout`; the local environment does not model transaction size, so this must be re-measured against testnet.
+5. ⚠️ **Resource limits** — instruction count, ledger entry size, transaction size. Measured _locally_ at 40 recipients for `batch_payout`; the local environment does not model transaction size, so this must be re-measured against testnet.
 6. **Whether the Stellar Asset Contract interface has changed** for the token calls the contracts make. `transfer`, `transfer_from` and `approve` all work as expected against soroban-sdk 27's test SAC, but this has not been checked against a live network.
 
 Also note, discovered while building: **`env.events().publish` is deprecated** in soroban-sdk 27 in favour of `#[contractevent]`. Any guidance written against the older API will produce deprecation warnings that CI treats as errors.
@@ -382,7 +470,6 @@ Where current documentation contradicts this spec, current documentation wins. N
 Issues labelled `good-first-issue` are scoped so that someone new to Soroban can complete them. Start there, comment to claim, and open a draft PR early — an in-progress PR with questions is more useful than a perfect one that arrives three weeks late.
 
 If you are unsure whether something is in scope, open an issue before writing code.
-
 
 ## Updates
 

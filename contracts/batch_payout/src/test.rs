@@ -3,11 +3,11 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Events as _},
     token::{StellarAssetClient, TokenClient},
-    vec, Address, Env, Vec,
+    vec, Address, Env, Event, Vec,
 };
-use sororail_common::Error;
+use sororail_common::{testutils::TestEnv, Error};
 
 use crate::{
     contract::{BatchPayoutContract, BatchPayoutContractClient},
@@ -26,13 +26,10 @@ struct Fixture<'a> {
 
 impl Fixture<'_> {
     fn new() -> Self {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let funder = Address::generate(&env);
-        let issuer = Address::generate(&env);
-        let token_address = env.register_stellar_asset_contract_v2(issuer).address();
-        StellarAssetClient::new(&env, &token_address).mint(&funder, &MINT);
+        let te = TestEnv::new();
+        let (token, funder) = te.make_token(MINT);
+        let token_address = token.address.clone();
+        let env = te.env().clone();
 
         let client = BatchPayoutContractClient::new(&env, &env.register(BatchPayoutContract, ()));
         Fixture {
@@ -88,6 +85,10 @@ fn execute_pays_each_recipient_their_own_amount() {
     ];
 
     let receipt = f.client.execute(&f.funder, &f.token.address, &batch);
+    // Capture immediately: subsequent token balance invocations replace the
+    // events returned by `events().all()`.
+    let all = f.env.events().all();
+    let events = all.events();
     assert_eq!(
         receipt,
         Receipt {
@@ -102,17 +103,58 @@ fn execute_pays_each_recipient_their_own_amount() {
     // The contract is a conduit; it holds nothing.
     assert_eq!(f.token.balance(&f.client.address), 0);
 
-    let events = f.env.events().all();
-    assert_eq!(events.len(), 1);
-
-    let executed_event = &events[0];
+    // `execute` emits one token transfer per recipient before its own
+    // `Executed`, so take the last event rather than assuming an index.
+    let executed_event = events.last().expect("no events emitted");
     let expected = Executed {
         funder: f.funder.clone(),
         token: f.token.address.clone(),
         count: 3,
         total: 357,
     };
-    assert_eq!(executed_event, &expected);
+    assert_eq!(executed_event, &expected.to_xdr(&f.env, &f.client.address));
+}
+
+#[test]
+fn execute_emits_the_total_and_recipient_count() {
+    let f = Fixture::new();
+    let recipients = f.addresses(2);
+    let payments = vec![
+        &f.env,
+        Payment {
+            to: recipients.get(0).unwrap(),
+            amount: 125,
+        },
+        Payment {
+            to: recipients.get(1).unwrap(),
+            amount: 875,
+        },
+    ];
+
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
+    let expected = Executed {
+        funder: f.funder,
+        token: f.token.address,
+        count: 2,
+        total: 1_000,
+    };
+    let all = f.env.events().all();
+    let events = all.events();
+    assert_eq!(
+        events.last().expect("no events emitted"),
+        &expected.to_xdr(&f.env, &f.client.address)
+    );
+}
+
+#[test]
+fn execute_leaves_no_token_balance_on_the_contract() {
+    let f = Fixture::new();
+    let payments = f.payments(3, 37);
+
+    f.client.execute(&f.funder, &f.token.address, &payments);
+
+    assert_eq!(f.token.balance(&f.client.address), 0);
 }
 
 #[test]
@@ -165,6 +207,49 @@ fn execute_rejects_non_positive_amounts_before_paying_anyone() {
 }
 
 #[test]
+fn execute_rejects_a_zero_amount_payment_inside_a_larger_batch() {
+    // The other non-positive-amount test only uses a 2-line batch; this
+    // checks the same all-or-nothing validation holds with several valid
+    // lines around the bad one, not just a single good line next to it (#264).
+    let f = Fixture::new();
+    let recipients: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&f.env)).collect();
+    let mut batch = Vec::new(&f.env);
+    for (i, to) in recipients.iter().enumerate() {
+        batch.push_back(Payment {
+            to: to.clone(),
+            // The third of five payments is the zero amount.
+            amount: if i == 2 { 0 } else { 100 },
+        });
+    }
+
+    assert_eq!(
+        f.client.try_execute(&f.funder, &f.token.address, &batch),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // All-or-nothing: none of the four otherwise-valid lines were paid either.
+    for to in &recipients {
+        assert_eq!(f.token.balance(to), 0);
+    }
+    assert_eq!(f.token.balance(&f.funder), MINT);
+}
+
+#[test]
+fn preview_rejects_a_zero_amount_payment_inside_a_larger_batch() {
+    // `preview` runs the same validation as `execute` (#264); nothing to
+    // assert about balances since preview never moves funds.
+    let f = Fixture::new();
+    let mut batch = Vec::new(&f.env);
+    for i in 0..5 {
+        batch.push_back(Payment {
+            to: Address::generate(&f.env),
+            amount: if i == 2 { 0 } else { 100 },
+        });
+    }
+
+    assert_eq!(f.client.try_preview(&batch), Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
 fn execute_rejects_a_total_that_overflows() {
     let f = Fixture::new();
     let batch = vec![
@@ -212,7 +297,6 @@ fn a_batch_the_funder_cannot_afford_pays_nobody() {
     assert_eq!(f.token.balance(&f.funder), MINT);
 }
 
-
 /// Same host-revert guarantee as the other contracts: a failed mid-batch
 /// transfer leaves no partial mutation (batch_payout is otherwise stateless).
 #[test]
@@ -242,6 +326,72 @@ fn paying_the_same_address_twice_is_allowed() {
     assert_eq!(f.token.balance(&a), 150);
 }
 
+/// Issue #479: pins the behaviour left by removing duplicate detection.
+///
+/// Error 102 was `BatchDuplicateRecipient`; it was removed before release
+/// (see the "What is absent, and why" note in `errors.rs` and the reserved
+/// slot in `sororail_common::errors`) because an on-chain duplicate check
+/// costs a quadratic scan and paying one address twice is legitimate. The
+/// consequence is that both transfers occur: the recipient receives the sum
+/// and the receipt counts each line separately.
+#[test]
+fn duplicate_recipients_are_each_paid_and_counted_in_the_receipt() {
+    let f = Fixture::new();
+    let dup = Address::generate(&f.env);
+    let other = Address::generate(&f.env);
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: dup.clone(),
+            amount: 100,
+        },
+        Payment {
+            to: other.clone(),
+            amount: 25,
+        },
+        Payment {
+            to: dup.clone(),
+            amount: 50,
+        },
+    ];
+
+    let receipt = f.client.execute(&f.funder, &f.token.address, &batch);
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 175
+        }
+    );
+    // Both lines for the duplicate address arrived, summed.
+    assert_eq!(f.token.balance(&dup), 150);
+    assert_eq!(f.token.balance(&other), 25);
+    assert_eq!(f.token.balance(&f.funder), MINT - 175);
+    assert_eq!(f.token.balance(&f.client.address), 0);
+}
+
+/// Same as above for `execute_equal`: the same address listed twice is paid
+/// twice and counted twice (no `BatchDuplicateRecipient`, see error 102).
+#[test]
+fn execute_equal_pays_a_duplicate_recipient_once_per_line() {
+    let f = Fixture::new();
+    let dup = Address::generate(&f.env);
+    let recipients = vec![&f.env, dup.clone(), dup.clone()];
+
+    let receipt = f
+        .client
+        .execute_equal(&f.funder, &f.token.address, &recipients, &40);
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 2,
+            total: 80
+        }
+    );
+    assert_eq!(f.token.balance(&dup), 80);
+    assert_eq!(f.token.balance(&f.funder), MINT - 80);
+}
+
 #[test]
 #[should_panic]
 fn execute_requires_the_funders_authorization() {
@@ -258,6 +408,66 @@ fn execute_requires_the_funders_authorization() {
         },
     ];
     client.execute(&funder, &token, &batch);
+}
+
+#[test]
+fn execute_rejects_payment_to_contract_address() {
+    let f = Fixture::new();
+    let contract = f.client.address.clone();
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: contract,
+            amount: 100,
+        },
+    ];
+    assert_eq!(
+        f.client.try_execute(&f.funder, &f.token.address, &batch),
+        Err(Ok(Error::IdenticalParties))
+    );
+}
+
+#[test]
+fn preview_rejects_payment_to_contract_address() {
+    let f = Fixture::new();
+    let contract = f.client.address.clone();
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: contract,
+            amount: 100,
+        },
+    ];
+    assert_eq!(
+        f.client.try_preview(&batch),
+        Err(Ok(Error::IdenticalParties))
+    );
+}
+
+#[test]
+fn execute_rejects_multiple_invalid_args_in_order() {
+    let f = Fixture::new();
+    let contract = f.client.address.clone();
+    // Both empty batch AND self-payment: size check comes first
+    let empty_batch: Vec<Payment> = Vec::new(&f.env);
+    assert_eq!(
+        f.client
+            .try_execute(&f.funder, &f.token.address, &empty_batch),
+        Err(Ok(Error::BatchEmpty))
+    );
+
+    // Self-payment AND zero amount: self-payment check comes first
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: contract,
+            amount: 0,
+        },
+    ];
+    assert_eq!(
+        f.client.try_execute(&f.funder, &f.token.address, &batch),
+        Err(Ok(Error::IdenticalParties))
+    );
 }
 
 // ----------------------------------------------------------- execute_equal
@@ -281,6 +491,27 @@ fn execute_equal_pays_everyone_the_same() {
         assert_eq!(f.token.balance(&r), 200);
     }
     assert_eq!(f.token.balance(&f.funder), MINT - 1_000);
+}
+
+#[test]
+fn execute_equal_applies_the_exact_amount_without_rounding() {
+    let f = Fixture::new();
+    let recipients = f.addresses(3);
+
+    let receipt = f
+        .client
+        .execute_equal(&f.funder, &f.token.address, &recipients, &7);
+
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 21
+        }
+    );
+    for recipient in recipients.iter() {
+        assert_eq!(f.token.balance(&recipient), 7);
+    }
 }
 
 #[test]
@@ -320,6 +551,48 @@ fn execute_equal_rejects_a_batch_over_the_cap() {
 }
 
 #[test]
+fn execute_equal_rejects_contract_address_in_recipients() {
+    let f = Fixture::new();
+    let contract = f.client.address.clone();
+    let mut recipients = f.addresses(2);
+    recipients.push_back(contract);
+    assert_eq!(
+        f.client
+            .try_execute_equal(&f.funder, &f.token.address, &recipients, &100),
+        Err(Ok(Error::IdenticalParties))
+    );
+}
+
+#[test]
+fn execute_equal_rejects_multiple_invalid_args_in_order() {
+    let f = Fixture::new();
+    let contract = f.client.address.clone();
+    // Non-positive amount comes before size check
+    assert_eq!(
+        f.client
+            .try_execute_equal(&f.funder, &f.token.address, &f.addresses(0), &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Size check comes before self-payment check
+    let mut oversized = f.addresses(MAX_RECIPIENTS + 1);
+    oversized.push_back(contract.clone());
+    assert_eq!(
+        f.client
+            .try_execute_equal(&f.funder, &f.token.address, &oversized, &100),
+        Err(Ok(Error::BatchTooLarge))
+    );
+
+    // Self-payment check comes before total calculation
+    let recipients = vec![&f.env, contract];
+    assert_eq!(
+        f.client
+            .try_execute_equal(&f.funder, &f.token.address, &recipients, &i128::MAX),
+        Err(Ok(Error::IdenticalParties))
+    );
+}
+
+#[test]
 fn execute_equal_rejects_a_total_that_overflows() {
     let f = Fixture::new();
     let recipients = f.addresses(2);
@@ -345,6 +618,51 @@ fn preview_totals_without_moving_anything() {
         }
     );
     assert_eq!(f.token.balance(&f.funder), MINT);
+}
+
+#[test]
+fn preview_returns_the_correct_receipt_and_moves_nothing() {
+    // The existing uniform-amount preview test can't catch a `Receipt` whose
+    // `total` happens to equal `count * amount` by coincidence; this uses
+    // distinct amounts so `count` and `total` are independently verified,
+    // and checks every balance plus the event log, not just the funder's
+    // (#265).
+    let f = Fixture::new();
+    let a = Address::generate(&f.env);
+    let b = Address::generate(&f.env);
+    let c = Address::generate(&f.env);
+    let batch = vec![
+        &f.env,
+        Payment {
+            to: a.clone(),
+            amount: 11,
+        },
+        Payment {
+            to: b.clone(),
+            amount: 22,
+        },
+        Payment {
+            to: c.clone(),
+            amount: 33,
+        },
+    ];
+
+    let receipt = f.client.preview(&batch);
+    assert_eq!(
+        receipt,
+        Receipt {
+            count: 3,
+            total: 66
+        }
+    );
+
+    assert_eq!(f.token.balance(&a), 0);
+    assert_eq!(f.token.balance(&b), 0);
+    assert_eq!(f.token.balance(&c), 0);
+    assert_eq!(f.token.balance(&f.funder), MINT);
+    assert_eq!(f.token.balance(&f.client.address), 0);
+    // Unlike `execute`, `preview` never publishes an `Executed` event.
+    assert!(f.env.events().all().events().is_empty());
 }
 
 #[test]
@@ -385,7 +703,7 @@ fn a_full_size_batch_executes() {
         .client
         .execute_equal(&f.funder, &f.token.address, &recipients, &10);
     assert_eq!(receipt.count, MAX_RECIPIENTS);
-    assert_eq!(receipt.total, 10 * MAX_RECIPIENTS as i128);
+    assert_eq!(receipt.total, 10 * i128::from(MAX_RECIPIENTS));
 }
 
 /// Largest batch that executes under the test environment's budget.

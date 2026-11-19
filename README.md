@@ -77,6 +77,17 @@ make ci         # everything CI runs
 `cargo-nextest` is the test runner in CI. Install it locally with
 `cargo install cargo-nextest`.
 
+For token movement diagrams, see [docs/fund-flows.md](docs/fund-flows.md). For
+the pinned verifiable build and the CI hash comparison, see
+[docs/reproducible-builds.md](docs/reproducible-builds.md).
+
+### Local quickstart smoke test
+
+The optional **Quickstart smoke** workflow is manually triggered from the
+Actions tab. It builds every contract, starts a local `stellar/quickstart`
+container, and deploys each generated WASM artifact. It is intentionally not a
+required pull-request check.
+
 ## Design rules
 
 **Money math errors; it never saturates.** Every arithmetic operation goes
@@ -93,9 +104,13 @@ are the most common Soroban vulnerability class, so guards live in
 `sororail_common::auth` and every privileged entry point has a test asserting it
 fails for an unauthorized caller.
 
-**State expires.** Soroban archives entries that are not extended. Every entry
-point that touches storage extends the TTL of what it touched, using the helpers
-in `sororail_common::storage`.
+**State expires.** Soroban archives entries that are not extended. Mutating
+entry points extend the instance TTL, while read-only views do not write a
+ledger entry. Integrators operating grants, streams, subscriptions, or
+escrows longer than 30 days should schedule the contract's public `bump()`
+entry point before expiry. A caller pays the normal transaction and ledger
+write fees; if the instance has already been archived, it must first be
+restored through the network's archival-state restoration flow.
 
 
 ## Contract Immutability and Migration
@@ -128,7 +143,7 @@ Non-negotiable — this is what makes the contracts credible as a dependency:
   remaining always equals deposited, exactly, with no rounding leakage.
 - Integration tests in `tests/` deploying real token contracts over full
   lifecycles.
-- ≥90% line coverage, enforced in CI.
+- ≥90% line coverage plus region/function floors, enforced in CI.
 
 ## Status
 
@@ -144,6 +159,8 @@ Non-negotiable — this is what makes the contracts credible as a dependency:
 - [x] Coverage measured: 98.66% lines, against the ≥90% gate
 - [x] Testnet deployment, addresses recorded in [DEPLOYMENTS.md](DEPLOYMENTS.md)
 - [ ] `MAX_RECIPIENTS` re-measured against testnet (see below)
+- [ ] Crate names reserved on crates.io — tracked per-crate in
+      [DEPLOYMENTS.md](DEPLOYMENTS.md#cratesio-publication)
 
 ### Known gaps
 

@@ -15,6 +15,8 @@ impl RecurringContract {
     /// call, so a subscription never bills at the moment of signup without the
     /// payer seeing a period pass.
     ///
+    /// `payer` and `payee` must differ; a self-authorization is rejected.
+    ///
     /// **This call does not by itself let the payee take anything.** The payer
     /// must also `approve` this contract as a spender on the token for at
     /// least the amount they intend to allow. That allowance is the real cap:
@@ -30,6 +32,9 @@ impl RecurringContract {
     ) -> Result<(), Error> {
         if storage::is_initialized(&env) {
             return Err(Error::AlreadyInitialized);
+        }
+        if payer == payee {
+            return Err(Error::IdenticalParties);
         }
         math::require_positive(amount_per_period)?;
         if period_seconds == 0 {
@@ -83,13 +88,15 @@ impl RecurringContract {
     /// rather than banked -- see [`Authorization`] for why.
     pub fn charge(env: Env) -> Result<i128, Error> {
         let mut authorization = storage::load(&env)?;
+        // Require auth before state checks so unauthenticated callers cannot
+        // probe contract state via typed errors (CONTRIBUTING.md convention).
+        authorization.payee.require_auth();
         if authorization.cancelled {
             return Err(Error::RecurringCancelled);
         }
         if authorization.is_exhausted() {
             return Err(Error::RecurringExhausted);
         }
-        authorization.payee.require_auth();
 
         let now = env.ledger().timestamp();
         if now < authorization.next_chargeable_at {
@@ -104,6 +111,17 @@ impl RecurringContract {
         authorization.next_chargeable_at = now
             .checked_add(authorization.period_seconds)
             .ok_or(Error::InvalidTimeRange)?;
+        // The period is consumed and persisted here, *before* `transfer_from`
+        // moves any funds. This ordering is intentional: Soroban aborts the
+        // whole invocation and rolls back every state change when a host call
+        // (the token transfer) traps, so a failed transfer cannot leave the
+        // period consumed -- the `periods_charged` bump and the advanced
+        // `next_chargeable_at` are reverted together with the failed call.
+        // That rollback, not the save-first ordering itself, is what makes
+        // this safe; it also means a reentrant token sees the already-advanced
+        // `next_chargeable_at` and cannot charge the same period twice.
+        // Compare `escrow::pay`, where persisting state before the token call
+        // serves reentrancy protection specifically.
         storage::save(&env, &authorization);
 
         token::TokenClient::new(&env, &authorization.token).transfer_from(
@@ -150,25 +168,32 @@ impl RecurringContract {
     /// The earliest timestamp at which the next charge may be taken.
     ///
     /// Reports the stored schedule regardless of whether the authorization is
-    /// cancelled or exhausted; check [`Self::is_chargeable`] for whether a
+    /// cancelled or exhausted; check `is_chargeable` for whether a
     /// charge would actually succeed.
     pub fn next_chargeable_at(env: Env) -> Result<u64, Error> {
-        Ok(storage::load(&env)?.next_chargeable_at)
+        Ok(storage::load_view(&env)?.next_chargeable_at)
     }
 
     /// Whether a charge would succeed right now.
     pub fn is_chargeable(env: Env) -> Result<bool, Error> {
-        let authorization = storage::load(&env)?;
+        let authorization = storage::load_view(&env)?;
         Ok(authorization.is_chargeable_at(env.ledger().timestamp()))
     }
 
     /// Charges still permitted under the cap, if there is one.
     pub fn remaining_periods(env: Env) -> Result<Option<u32>, Error> {
-        Ok(storage::load(&env)?.remaining_periods())
+        Ok(storage::load_view(&env)?.remaining_periods())
+    }
+
+    /// Extends the instance TTL for a long-lived authorization without changing it.
+    pub fn bump(env: Env) -> Result<(), Error> {
+        storage::load_view(&env)?;
+        sororail_common::storage::extend_instance(&env);
+        Ok(())
     }
 
     /// The full authorization record.
     pub fn get(env: Env) -> Result<Authorization, Error> {
-        storage::load(&env)
+        storage::load_view(&env)
     }
 }

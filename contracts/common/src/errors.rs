@@ -22,6 +22,30 @@ use soroban_sdk::contracterror;
 /// | 100–119   | `batch_payout` |
 ///
 /// Ranges are deliberately sparse so a contract can grow without colliding.
+///
+/// Not every contract returns every variant. Each contract's own `errors.rs`
+/// carries a table of the variants it can raise and a "What is absent, and
+/// why" section naming the shared variants it never returns -- keep both in
+/// step when adding an error path to a contract.
+///
+/// # Generic errors that are currently single-contract
+///
+/// Some variants in the generic range (1–19) are currently used by only one
+/// contract but remain generic to allow future reuse without ABI breakage:
+///
+/// - **`DeadlineNotReached` (11)** and **`DeadlinePassed` (12)**: Currently
+///   only `escrow` uses these, but any future time-locked contract (e.g., a
+///   vested airdrop, a time-based auction) would naturally reuse them. Keeping
+///   them generic avoids having to add `EscrowDeadlineNotReached` now and a
+///   separate `VestingDeadlineNotReached` later, fragmenting what is
+///   conceptually the same failure mode.
+///
+/// - **`InvalidState` (10)** and **`InsufficientBalance` (13)**: Reserved for
+///   lifecycle and balance checks that contracts currently handle with
+///   contract-specific variants (e.g., `EscrowNotFunded`, `StreamCancelled`).
+///   Every contract prefers a more specific error today, but these remain
+///   available if a future contract's design benefits from a generic state or
+///   balance check without needing a new numbered variant.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -46,12 +70,26 @@ pub enum Error {
     /// Basis points outside the inclusive range 0..=10000.
     InvalidBasisPoints = 9,
     /// The action is not legal from the current state.
+    ///
+    /// Reserved for generic state checks. Currently unused; contracts prefer
+    /// contract-specific variants like `EscrowNotFunded` or `StreamCancelled`.
+    /// See module docs for rationale.
     InvalidState = 10,
     /// The deadline has not yet been reached.
+    ///
+    /// Currently used by `escrow::refund`. Kept generic for future time-locked
+    /// contracts. See module docs for rationale.
     DeadlineNotReached = 11,
     /// The deadline has already passed.
+    ///
+    /// Currently used by `escrow::fund`. Kept generic for future time-locked
+    /// contracts. See module docs for rationale.
     DeadlinePassed = 12,
     /// Not enough balance to satisfy the request.
+    ///
+    /// Reserved for generic balance checks. Currently unused; contracts let
+    /// token transfers fail with the token's own error or use contract-specific
+    /// variants like `StreamInsufficientAccrued`. See module docs for rationale.
     InsufficientBalance = 13,
     /// A duration was zero where a positive span is required.
     InvalidDuration = 14,
@@ -71,9 +109,13 @@ pub enum Error {
     EscrowNotDisputed = 24,
     /// `dispute` called on an escrow that is already disputed.
     EscrowAlreadyDisputed = 25,
+    /// `cancel` called on an escrow that is not in `Created`.
+    EscrowNotCancellable = 26,
+    /// `escrow::init` requires a neutral arbiter distinct from both participants.
+    EscrowArbiterNotNeutral = 27,
 
     // ----- stream: 40–59 -----
-    /// No stream exists for the given id.
+    /// Reserved for the future id-keyed stream design.
     StreamNotFound = 40,
     /// The stream has already been cancelled.
     StreamCancelled = 41,
@@ -85,7 +127,7 @@ pub enum Error {
     StreamNotExtendable = 44,
 
     // ----- vesting: 60–79 -----
-    /// No grant exists for the given id.
+    /// Reserved for the future id-keyed vesting design.
     VestingNotFound = 60,
     /// Nothing is claimable yet -- the cliff has not been reached.
     VestingCliffNotReached = 61,
@@ -97,9 +139,11 @@ pub enum Error {
     VestingCliffAfterEnd = 64,
     /// Nothing vested-but-unclaimed remains to claim.
     VestingNothingToClaim = 65,
+    /// `start + duration` would overflow `u64`.
+    VestingScheduleOverflow = 66,
 
     // ----- recurring: 80–99 -----
-    /// No authorization exists for the given id.
+    /// Reserved for the future id-keyed recurring design.
     RecurringNotFound = 80,
     /// The authorization has been cancelled.
     RecurringCancelled = 81,

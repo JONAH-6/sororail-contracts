@@ -20,6 +20,10 @@ impl BatchPayoutContract {
     /// The whole batch is validated and totalled **before** any money moves,
     /// so an invalid line is rejected without a partial payout ever being
     /// attempted.
+    ///
+    /// Paying the funder's own address is intentionally permitted. Such a
+    /// line counts toward the receipt total but transfers no net funds;
+    /// only transfers to this contract's own address are rejected.
     pub fn execute(
         env: Env,
         funder: Address,
@@ -27,9 +31,13 @@ impl BatchPayoutContract {
         recipients: Vec<Payment>,
     ) -> Result<Receipt, Error> {
         let count = Self::check_size(&recipients)?;
+        let contract_address = env.current_contract_address();
 
         let mut total: i128 = 0;
         for payment in recipients.iter() {
+            if payment.to == contract_address {
+                return Err(Error::IdenticalParties);
+            }
             math::require_positive(payment.amount)?;
             total = math::add(total, payment.amount)?;
         }
@@ -54,8 +62,10 @@ impl BatchPayoutContract {
 
     /// Pays every recipient the same amount, in one transaction.
     ///
-    /// The common payroll shape, and cheaper to submit than [`Self::execute`]
+    /// The common payroll shape, and cheaper to submit than `execute`
     /// because the amount crosses the wire once rather than once per line.
+    /// The funder may appear among recipients, including more than once;
+    /// those self-payments count in the receipt but have no net balance effect.
     pub fn execute_equal(
         env: Env,
         funder: Address,
@@ -66,7 +76,15 @@ impl BatchPayoutContract {
         math::require_positive(amount_each)?;
 
         let count = Self::check_size_of(recipients.len())?;
-        let total = math::mul(amount_each, count as i128)?;
+        let contract_address = env.current_contract_address();
+
+        for to in recipients.iter() {
+            if to == contract_address {
+                return Err(Error::IdenticalParties);
+            }
+        }
+
+        let total = math::mul(amount_each, i128::from(count))?;
 
         funder.require_auth();
 
@@ -96,13 +114,17 @@ impl BatchPayoutContract {
 
     /// Totals a batch without moving anything, for a pre-signature preview.
     ///
-    /// Runs exactly the validation [`Self::execute`] does, so a preview that
+    /// Runs exactly the validation `execute` does, so a preview that
     /// succeeds means the batch itself will not be rejected for size, an
     /// invalid amount, or an overflowing total.
-    pub fn preview(_env: Env, recipients: Vec<Payment>) -> Result<Receipt, Error> {
+    pub fn preview(env: Env, recipients: Vec<Payment>) -> Result<Receipt, Error> {
         let count = Self::check_size(&recipients)?;
+        let contract_address = env.current_contract_address();
         let mut total: i128 = 0;
         for payment in recipients.iter() {
+            if payment.to == contract_address {
+                return Err(Error::IdenticalParties);
+            }
             math::require_positive(payment.amount)?;
             total = math::add(total, payment.amount)?;
         }

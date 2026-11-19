@@ -46,7 +46,7 @@ use soroban_sdk::{
 /// te.advance_to(START + 1_000);
 /// ```
 pub struct TestEnv {
-    pub env: Env,
+    env: Env,
 }
 
 impl TestEnv {
@@ -73,17 +73,18 @@ impl TestEnv {
         Address::generate(&self.env)
     }
 
+    /// Borrows the wrapped Soroban environment for contract setup and calls.
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
     /// Registers a Stellar Asset Contract, mints `initial_supply` tokens to a
     /// freshly generated funder address, and returns `(TokenClient, funder)`.
     ///
     /// The returned [`TokenClient`] borrows from `self`, so it lives as long as
     /// the `TestEnv` does.
-    pub fn make_token(&self, initial_supply: i128) -> (TokenClient, Address) {
-        let issuer = Address::generate(&self.env);
-        let token_address = self
-            .env
-            .register_stellar_asset_contract_v2(issuer)
-            .address();
+    pub fn make_token(&self, initial_supply: i128) -> (TokenClient<'_>, Address) {
+        let token_address = self.register_token();
         let funder = Address::generate(&self.env);
         StellarAssetClient::new(&self.env, &token_address).mint(&funder, &initial_supply);
         let client = TokenClient::new(&self.env, &token_address);
@@ -93,18 +94,29 @@ impl TestEnv {
     /// Mints `amount` tokens of `token` to `recipient`.
     ///
     /// Useful when a test needs a single token but multiple funded accounts.
-    pub fn mint(
-        &self,
-        token: &soroban_sdk::Address,
-        recipient: &Address,
-        amount: i128,
-    ) {
+    pub fn mint(&self, token: &soroban_sdk::Address, recipient: &Address, amount: i128) {
         StellarAssetClient::new(&self.env, token).mint(recipient, &amount);
     }
 
     /// Sets the ledger timestamp to `ts`.
     pub fn advance_to(&self, ts: u64) {
         self.env.ledger().with_mut(|l| l.timestamp = ts);
+    }
+
+    /// Returns the environment's ledger time.
+    pub fn timestamp(&self) -> u64 {
+        self.env.ledger().timestamp()
+    }
+
+    /// Registers an unfunded Stellar Asset Contract and returns its address.
+    ///
+    /// Use [`Self::make_token`] when a named funder should receive an initial
+    /// supply as part of setup.
+    pub fn register_token(&self) -> Address {
+        let issuer = Address::generate(&self.env);
+        self.env
+            .register_stellar_asset_contract_v2(issuer)
+            .address()
     }
 }
 

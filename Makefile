@@ -2,7 +2,7 @@ WASM_TARGET := wasm32v1-none
 WASM_DIR    := target/$(WASM_TARGET)/release
 CONTRACTS   := escrow stream vesting recurring batch_payout
 
-.PHONY: all build test fmt fmt-check lint audit optimize specs clean ci
+.PHONY: all build test test-all test-contracts fmt fmt-check lint audit optimize wasm-size specs clean ci coverage check-error-docs verify-deployments check-deployments check-wasm-sizes
 
 all: build test
 
@@ -14,7 +14,15 @@ build:
 
 # Tests run on the host, not on wasm -- soroban_sdk::testutils needs std.
 test:
+	$(MAKE) test-all
+
+test-all:
 	cargo nextest run --workspace
+
+# Run every contract and shared-library test, excluding only the host-only
+# integration crate which has its own deployment-dependent test environment.
+test-contracts:
+	cargo test --workspace --exclude sororail-integration-tests
 
 fmt:
 	cargo fmt --all
@@ -23,7 +31,13 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
-	cargo clippy --workspace --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
+
+wasm-size: build
+	./scripts/check_wasm_sizes.sh $(WASM_DIR)
+
+verify-deployments:
+	./scripts/check_deployments.sh
 
 audit:
 	cargo audit
@@ -57,7 +71,24 @@ specs: build
 	done
 	@echo "specs written to dist/specs/"
 
-ci: fmt-check lint test build
+check-error-docs:
+	./scripts/check_error_docs.sh
+
+ci: fmt-check lint test build check-error-docs check-deployments check-wasm-sizes
+
+check-deployments:
+	./scripts/check_deployments.sh
+
+check-wasm-sizes:
+	./scripts/check_wasm_sizes.sh $(WASM_DIR)
+
+# Matches .github/workflows/ci.yml coverage job (lines / regions / functions).
+coverage:
+	cargo llvm-cov nextest --workspace \
+		--fail-under-lines 90 \
+		--fail-under-regions 75 \
+		--fail-under-functions 80
+	bash scripts/audit-error-variant-coverage.sh
 
 clean:
 	cargo clean
